@@ -66,6 +66,11 @@ class WindowMSA(BaseModule):
         self.proj_drop = nn.Dropout(proj_drop_rate)
         self.softmax = nn.Softmax(dim=-1)
 
+    # 实现W-MSA和SW-MSA机制
+    # attn和mask的计算公式为：
+    # attn = softmax((qk)/sqrt(d_k) + b + mask)v
+    # mask的值为-100，softmax后的值为0，相当于忽略掉对应的值
+    # b为相对位置偏差，用于实现SW-MSA机制
     def forward(self, x, mask=None):
         """
         Args:
@@ -74,15 +79,24 @@ class WindowMSA(BaseModule):
             mask (tensor | None, Optional): mask with shape of (num_windows,
                 Wh*Ww, Wh*Ww), value should be between (-inf, 0].
         """
+
+        # 使用全连接层将输入特征图一分为三，分别为q、k、v，形状从[B,N,C]变为[B,N,3,C]
+        # 为了实现Mult-Head并行计算机制，把输入特征图拆分成num_heads份，形状从[B,N,3,C]变为[B,N,3,H,C//H]
+        # 最后再将形状变成[3,B,H,N,C//H]，以便于拆分成q、k、v，便于计算qk的乘积，拆分后q、k、v的形状为[B,H,N,C//H]
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads,
                                   C // self.num_heads).permute(2, 0, 3, 1, 4)
         # make torchscript happy (cannot use tensor as tuple)
         q, k, v = qkv[0], qkv[1], qkv[2]
 
+        # scale就是论文中的缩放因子1/sqrt(d_k)，用于缩放q和k的乘积
         q = q * self.scale
+
+        # 计算attn = (qk)/sqrt(d_k)，计算前q和k的形状为[B, H, N, C//H]
+        # 计算后，attn的形状是[B, H, N, N]
         attn = (q @ k.transpose(-2, -1))
 
+        # 计算相对位置偏差，并加到q和k的乘积上，也就是attn = softmax((qk)/sqrt(d_k) + b)v 中的b
         relative_position_bias = self.relative_position_bias_table[
             self.relative_position_index.view(-1)].view(
                 self.window_size[0] * self.window_size[1],
@@ -92,6 +106,9 @@ class WindowMSA(BaseModule):
             2, 0, 1).contiguous()  # nH, Wh*Ww, Wh*Ww
         attn = attn + relative_position_bias.unsqueeze(0)
 
+        # 将mask加到attn上，再进行softmax，mask的值为-100，softmax后的值为0，相当于忽略掉对应的值
+        # 该mask主要用于实现Shifted Window Attention机制
+        # 如果mask为None，则相当于进行W-MSA，如果mask不为None，则相当于进行SW-MSA
         if mask is not None:
             nW = mask.shape[0]
             attn = attn.view(B // nW, nW, self.num_heads, N,
@@ -99,10 +116,15 @@ class WindowMSA(BaseModule):
             attn = attn.view(-1, self.num_heads, N, N)
         attn = self.softmax(attn)
 
+        # 对attn进行dropout
         attn = self.attn_drop(attn)
 
+        # 计算注意力的最后一步，即attn和v的乘积，形状是[B,H,N,C//H]
+        # 再将Multi-Head的结果的形状还原成[B, N, C]
         x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        # 使用全连接层对特征进行映射
         x = self.proj(x)
+        # 对输出特征进行dropout
         x = self.proj_drop(x)
         return x
 
@@ -137,14 +159,14 @@ class ShiftWindowMSA(BaseModule):
     """
 
     def __init__(self,
-                 embed_dims,
-                 num_heads,
-                 window_size,
-                 shift_size=0,
-                 qkv_bias=True,
-                 qk_scale=None,
-                 attn_drop_rate=0,
-                 proj_drop_rate=0,
+                 embed_dims, # 输入特征图的通道数C
+                 num_heads,  # 多头注意力的头数H
+                 window_size,  # 窗口的大小，默认值为7，也就是MSA的计算单元的大小
+                 shift_size=0, # 循环移位的步长，这里是7//2=3，也就是不进行循环移位
+                 qkv_bias=True, # 使用全连接对qkv进行空间映射时，是否使用偏置
+                 qk_scale=None, # 缩放因子，用于缩放q和k的乘积，将覆盖默认值1/sqrt(d_k)
+                 attn_drop_rate=0, # 注意力权重的dropout率
+                 proj_drop_rate=0, # 输出特征的dropout率
                  dropout_layer=dict(type='DropPath', drop_prob=0.),
                  init_cfg=None):
         super().__init__(init_cfg)
@@ -177,6 +199,7 @@ class ShiftWindowMSA(BaseModule):
         query = F.pad(query, (0, 0, 0, pad_r, 0, pad_b))
         H_pad, W_pad = query.shape[1], query.shape[2]
 
+        # 对输入特征图进行循环移位，计算SW_MSA中循环移位所需要的mask
         # cyclic shift
         if self.shift_size > 0:
             shifted_query = torch.roll(
@@ -210,20 +233,28 @@ class ShiftWindowMSA(BaseModule):
             shifted_query = query
             attn_mask = None
 
+        # 将输入特征图[B, H, W, C]划分成若干个窗口，每个窗口为7*7，输出特征图的形状为[B*H/7*W/7, 7, 7, C]
+        # 窗口是MSA的计算单元，计算窗口中每个像素与其他49个像素的关系
         # nW*B, window_size, window_size, C
         query_windows = self.window_partition(shifted_query)
         # nW*B, window_size*window_size, C
+        # 将窗口中的像素展开成一维向量，形状为[B*H/7*W/7, 49, C]
         query_windows = query_windows.view(-1, self.window_size**2, C)
 
+        # 对窗口进行W-MSA或SW-MSA计算，输入输出的形状都是[B*H/7*W/7, 49, C]
         # W-MSA/SW-MSA (nW*B, window_size*window_size, C)
         attn_windows = self.w_msa(query_windows, mask=attn_mask)
 
+        # 将输出特征图的形状从[B*H/7*W/7, 49, C]变为[B*H/7*W/7, 7, 7, C]
         # merge windows
         attn_windows = attn_windows.view(-1, self.window_size,
                                          self.window_size, C)
 
+        # 将拆分的若干个窗口[B*H/7*W/7, 7, 7, C]还原成特征图，输出形状是[B, H, W, C]
         # B H' W' C
         shifted_x = self.window_reverse(attn_windows, H_pad, W_pad)
+
+        # 还原循环移位后的特征图
         # reverse cyclic shift
         if self.shift_size > 0:
             x = torch.roll(
@@ -241,6 +272,7 @@ class ShiftWindowMSA(BaseModule):
         x = self.drop(x)
         return x
 
+    # @info 将拆分若干个窗口还原成特征图，输出形状是[B, H, W, C]
     def window_reverse(self, windows, H, W):
         """
         Args:
@@ -250,13 +282,18 @@ class ShiftWindowMSA(BaseModule):
         Returns:
             x: (B, H, W, C)
         """
+        # windows的形状是[B*H/7*W/7, 7, 7, C]
         window_size = self.window_size
+        # 从B*H/7*W/7中还原出B
         B = int(windows.shape[0] / (H * W / window_size / window_size))
+        # 将windows的形状变成[B, H/7, W/7, 7, 7, C]
         x = windows.view(B, H // window_size, W // window_size, window_size,
                          window_size, -1)
+        # 将windows的形状变成[B, H/7, 7, W/7, 7, C]，最后再还原成[B, H, W, C]
         x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, H, W, -1)
         return x
 
+    # @info 将输入特征图拆分成若干个窗口，每个窗口为7*7，输出特征图的形状为[B*H/7*W/7, 7, 7, C]
     def window_partition(self, x):
         """
         Args:
@@ -268,11 +305,17 @@ class ShiftWindowMSA(BaseModule):
         window_size = self.window_size
         x = x.view(B, H // window_size, window_size, W // window_size,
                    window_size, C)
+        # 特征图形状变成[B, H/7, W/7, 7, 7, C]
         windows = x.permute(0, 1, 3, 2, 4, 5).contiguous()
+        # 将不同Batch的窗口展开成一维向量，形状为[B*H/7*W/7, 7, 7, C]
         windows = windows.view(-1, window_size, window_size, C)
         
         return windows
 
+# Swin Transformer的具体实现
+# 即实现W-MSA和SW-MSA机制
+# W-MSA是Window Multihead Self-Attention的缩写
+# SW-MSA是Shifted Window Multihead Self-Attention的缩写
 class SwinBlock(BaseModule):
     """"
     Args:
@@ -320,11 +363,16 @@ class SwinBlock(BaseModule):
         self.with_cp = with_cp
         
         self.norm1 = build_norm_layer(norm_cfg, embed_dims)[1]
+
+        # 构造W-MSA或SW-MSA
+        # 每个窗口的大小为7*7，窗口是MSA的计算单元，计算窗口中每个像素与其他49个像素的关系
+        # 如果shift为True，则使用SW-MSA，否则使用W-MSA
+        # 如果使用SW-MSA，则每个窗口会进行循环移位，移位的步长为窗口的一半，即7/2=3
         self.attn = ShiftWindowMSA(
-            embed_dims=embed_dims,
-            num_heads=num_heads,
-            window_size=window_size,
-            shift_size=window_size // 2 if shift else 0,
+            embed_dims=embed_dims, # 输入特征图的通道数
+            num_heads=num_heads, # 多头注意力的头数
+            window_size=window_size, # 窗口大小，默认为7，也就是每个窗口为7*7，MSA只在这7*7的窗口内进行计算
+            shift_size=window_size // 2 if shift else 0, # 循环移动的步长，默认为窗口的一半，7/2=3
             qkv_bias=qkv_bias,
             qk_scale=qk_scale,
             attn_drop_rate=attn_drop_rate,

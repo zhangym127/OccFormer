@@ -58,13 +58,14 @@ class MSDeformAttnPixelDecoder3D(BaseModule):
         super().__init__(init_cfg=init_cfg)
         
         self.strides = strides
-        self.num_input_levels = len(in_channels)
-        self.num_encoder_levels = encoder.transformerlayers.attn_cfgs.num_levels
+        self.num_input_levels = len(in_channels) # 4, 实际的in_channels=[128, 256, 512, 1024]
+        self.num_encoder_levels = encoder.transformerlayers.attn_cfgs.num_levels # 实际值是3
         assert self.num_encoder_levels >= 1
         
         # build input conv for channel adapation
         # from top to down (low to high resolution)
         input_conv_list = []
+        # for i in range(3, 0, -1):
         for i in range(self.num_input_levels - 1,
                 self.num_input_levels - self.num_encoder_levels - 1, -1):
             input_conv = ConvModule(
@@ -150,19 +151,24 @@ class MSDeformAttnPixelDecoder3D(BaseModule):
         spatial_shapes = []
         reference_points_list = []
         
+        # 按照从后向前的顺序，将第3、2、1层的特征图拼接起来，作为编码器的输入
+        # 第0层的特征图作为FPN的输入
         for i in range(self.num_encoder_levels):
             # 从最后一层输入开始
             level_idx = self.num_input_levels - i - 1
             feat = feats[level_idx]
+            # 对输入特征进行卷积，完成空间映射
             feat_projected = self.input_convs[i](feat)
             X, Y, Z = feat.shape[-3:]
             
             # no padding
+            # 获得查询位置编码
             padding_mask_resized = feat.new_zeros((batch_size, ) + feat.shape[-3:], dtype=torch.bool)
             pos_embed = self.postional_encoding(padding_mask_resized)
             level_embed = self.level_encoding.weight[i]
             level_pos_embed = level_embed.view(1, -1, 1, 1, 1) + pos_embed
             
+            # 生成参考点，作为MSDA的输入
             # (h_i * w_i * d_i, 2)
             reference_points = self.point_generator.single_level_grid_priors(
                 feat.shape[-3:], level_idx, device=feat.device)
@@ -203,6 +209,11 @@ class MSDeformAttnPixelDecoder3D(BaseModule):
         valid_radios = reference_points.new_ones(
             (batch_size, self.num_encoder_levels, 2))
         
+        # 下面通过六层的编码器来对输入查询进行编码，结构上与BEVFormer完全相同，唯一的区别是仅使用了自注意力机制，没有使用交叉注意力
+        # 关于自注意力机制，需要重点关注几个输入：
+        # 1. query: 输入特征图，来自对输入特征图的卷积
+        # 2. query_pos: 查询位置编码，来自对输入特征图的位置编码
+        # 3. reference_points: 参考点，来自输入特征图的网格点
         # shape (num_total_query, batch_size, c)
         memory = self.encoder(
             query=encoder_inputs,
@@ -221,20 +232,34 @@ class MSDeformAttnPixelDecoder3D(BaseModule):
         # (num_total_query, batch_size, c) -> (batch_size, c, num_total_query)
         memory = memory.permute(1, 2, 0)
 
+        # memory的内容由多层的输出复合而成，下面分解出每一层的输出
+
+        # 首先计算出每一层的查询数量
         # from low resolution to high resolution
         num_query_per_level = [e[0] * e[1] * e[2] for e in spatial_shapes]
+
+        # 将memory按照每一层的查询数量进行切分，返回一个列表，列表中的每个元素对应一层的输出
+        # 每一层的形状为：(batch_size, c, num_total_query)
         outs = torch.split(memory, num_query_per_level, dim=-1)
+
+        # 将outs列表中的每一层输出张量的形状reshape成：(batch_size, c, x_i, y_i, z_i)
         outs = [
             x.reshape(batch_size, -1, spatial_shapes[i][0],
                 spatial_shapes[i][1], 
                 spatial_shapes[i][2]) for i, x in enumerate(outs)]
         
+        # 下面处理第0层的特征图，将其作为FPN的输入，最后输出掩码特征图
         # build FPN path
+        # for i in range(0, -1, -1): 循环1次，i=0
         for i in range(self.num_input_levels - self.num_encoder_levels - 1, -1,
                        -1):
+            # 取第0层的输入特征图
             x = feats[i]
+            # 对输入特征图进行卷积，完成空间映射
             cur_feat = self.lateral_convs[i](x)
             
+            # 对输出张量的最后一层进行上采样，使其与当前层的输入特征图尺寸相同
+            # 然后将上采样后的输出张量与第0层的输入特征图相加，得到当前层的输出
             y = cur_feat + F.interpolate(
                 outs[-1],
                 size=cur_feat.shape[-3:],
@@ -242,8 +267,12 @@ class MSDeformAttnPixelDecoder3D(BaseModule):
                 align_corners=False,
             )
             
+            # 对当前层的输出进行卷积，得到最终的输出
             y = self.output_convs[i](y)
+            # 将最终的输出添加到outs列表的最后
             outs.append(y)
         
+        # 将最后一层的输出y通过卷积层，得到掩码特征图
         outs[-1] = self.mask_feature(outs[-1])
+        # 将outs列表中的张量逆序排列（特征图从大到小），掩码特征图在最前面
         return outs[::-1]

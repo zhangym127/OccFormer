@@ -27,6 +27,8 @@ class OccupancyEncoder(BaseModule):
         super().__init__()
         self.out_indices = out_indices
         
+        # 占用编码器划分为4个阶段，每个阶段的输出通道数分别为64, 128, 256, 512
+        # 下面分别为这四个阶段构造双路径Swin Transformer
         # build layers
         self.num_layers = 0
         self.layers = nn.ModuleList()
@@ -61,6 +63,10 @@ class OccupancyEncoder(BaseModule):
         
         return nn.Sequential(*layers)
 
+    # @info 按照事先设定的四个阶段，分层逐一调用双路径Swin Transformer进行特征提取
+    # 每一层都会通过卷积对输入特征图进行下采样，尺寸减半，通道数翻倍
+    # 每一层的输出作为下一层的输入，各层输出的特征图尺寸依次减半，通道数翻倍
+    # 每一层的输出都被保存下来，最后将四层的多尺度特征图给到MSDA
     def forward(self, x):
         res = []
         for index, layer in enumerate(self.layers):

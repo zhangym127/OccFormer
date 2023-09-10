@@ -232,6 +232,7 @@ class MultiScaleDeformableAttention3D(BaseModule):
         if value is None:
             value = query
 
+        # 这里将query直通到输出，效果类似于残差连接
         if identity is None:
             identity = query
         if query_pos is not None:
@@ -253,9 +254,11 @@ class MultiScaleDeformableAttention3D(BaseModule):
             value = value.masked_fill(key_padding_mask[..., None], 0.0)
         value = value.view(bs, num_value, self.num_heads, -1)
         
+        # 以查询为输入，通过全连接层，得到采样偏移
         sampling_offsets = self.sampling_offsets(query).view(
             bs, num_query, self.num_heads, self.num_levels, self.num_points, 3)
         
+        # 以查询为输入，通过全连接层，得到采样权重
         attention_weights = self.attention_weights(query).view(
             bs, num_query, self.num_heads, self.num_levels * self.num_points)
         attention_weights = attention_weights.softmax(-1)
@@ -270,13 +273,17 @@ class MultiScaleDeformableAttention3D(BaseModule):
              spatial_shapes[..., 1], 
              spatial_shapes[..., 0]], -1)
         
+        # 基于参考点和采样偏移，计算采样位置
         # reference_points: [batch, num_query, num_level, 3]
         sampling_locations = reference_points[:, :, None, :, None, :] \
             + sampling_offsets \
             / offset_normalizer[None, None, None, :, None, :]
         
+        # 通过MSDA，计算输出
         output = multi_scale_deformable_attn_pytorch(
             value, spatial_shapes, sampling_locations, attention_weights)
+        
+        # 对输出应用全连接层
         output = self.output_proj(output)
 
         if not self.batch_first:

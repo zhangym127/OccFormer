@@ -423,6 +423,15 @@ class Mask2FormerNuscOccHead(MaskFormerHead):
 
         return loss_cls, loss_mask, loss_dice
 
+    # @info 上一层解码器输出的查询特征向量通过全连接层映射为分类预测和掩码嵌入，
+    # 掩码嵌入与掩码特征向量进行点乘，得到掩码预测，
+    # 通过对掩码预测进行降采样，得到注意力掩码，
+    # @param decoder_out：query_feat：可学习的查询特征向量
+    # @param mask_feature：：掩码特征向量
+    # @param attn_mask_target_size：目标注意力掩码的尺寸
+    # @return cls_pred：分类预测
+    # @return mask_pred：掩码预测
+    # @return attn_mask：注意力掩码
     def forward_head(self, decoder_out, mask_feature, attn_mask_target_size):
         """Forward for head part which is called after every decoder layer.
 
@@ -445,15 +454,25 @@ class Mask2FormerNuscOccHead(MaskFormerHead):
         """
         decoder_out = self.transformer_decoder.post_norm(decoder_out)
         decoder_out = decoder_out.transpose(0, 1)
+
+        # 查询特征通过一个全连接层，映射为分类预测，输出通道数变为 self.num_classes + 1
         # shape (batch_size, num_queries, c)
         cls_pred = self.cls_embed(decoder_out)
+
+        # 查询特征通过连续三个全连接层，映射为掩码嵌入，输出通道数为 out_channels
         # shape (batch_size, num_queries, c)
         mask_embed = self.mask_embed(decoder_out)
+
+        # 掩码嵌入与掩码特征向量进行点乘，得到掩码预测
+        # 其中掩码嵌入来源于上一层解码器的查询特征，掩码特征向量来源于编码器输出
+        # FIXME:torch.einsum('bqc,bcxyz->bqxyz', mask_embed, mask_feature)是什么意思？？？
+        # 答：torch.einsum('bqc,bcxyz->bqxyz', mask_embed, mask_feature) = torch.matmul(mask_embed, mask_feature)
         # shape (batch_size, num_queries, h, w)
         mask_pred = torch.einsum('bqc,bcxyz->bqxyz', mask_embed, mask_feature)
         
         ''' 对于一些样本数量较少的类别来说，经过 trilinear 插值 + 0.5 阈值，正样本直接消失 '''
         
+        # 对掩码预测进行降采样，得到注意力掩码
         if self.pooling_attn_mask:
             # however, using max-pooling can save more positive samples, which is quite important for rare classes
             attn_mask = F.adaptive_max_pool3d(mask_pred.float(), attn_mask_target_size)
@@ -468,6 +487,7 @@ class Mask2FormerNuscOccHead(MaskFormerHead):
         # repeat for the num_head axis, (batch_size, num_queries, num_seq) -> (batch_size * num_head, num_queries, num_seq)
         attn_mask = attn_mask.unsqueeze(1).repeat((1, self.num_heads, 1, 1)).flatten(0, 1)
 
+        # 返回分类预测、掩码预测、注意力掩码
         return cls_pred, mask_pred, attn_mask
 
     def preprocess_gt(self, gt_occ, img_metas):
@@ -586,6 +606,9 @@ class Mask2FormerNuscOccHead(MaskFormerHead):
 
         return losses
 
+    # @info
+    # @param voxel_feats：编码器输出的特征向量列表，总共有四个，第一个是掩码特征图，后面三个是多尺度特征图，从大到小排序
+    # @param img_metas：图像元信息
     def forward(self, 
             voxel_feats,
             img_metas,
@@ -611,7 +634,10 @@ class Mask2FormerNuscOccHead(MaskFormerHead):
         """
         
         batch_size = len(img_metas)
+        # voxel_feats列表中的第一个元素是掩码特征图
         mask_features = voxel_feats[0]
+        # 获得voxel_feats列表的逆序列表，但是不包括第一个元素
+        # 获得多尺度特征图，从小到大，形状是[B, C, X, Y, Z]
         multi_scale_memorys = voxel_feats[:0:-1]
         
         decoder_inputs = []
@@ -638,6 +664,10 @@ class Mask2FormerNuscOccHead(MaskFormerHead):
         query_feat = self.query_feat.weight.unsqueeze(1).repeat((1, batch_size, 1))
         query_embed = self.query_embed.weight.unsqueeze(1).repeat((1, batch_size, 1))
         
+        # 在第一层解码器之前，直接预测类别、掩码和注意力掩码:
+        # query_feat是可学习的参数
+        # mask_features是掩码特征图
+        # multi_scale_memorys[0].shape[-3:]是多尺度特征图的尺寸，即[B, C, X, Y, Z]中的[X, Y, Z]
         ''' directly deocde the learnable queries, as simple proposals '''
         cls_pred_list = []
         mask_pred_list = []
@@ -652,20 +682,49 @@ class Mask2FormerNuscOccHead(MaskFormerHead):
             attn_mask[torch.where(
                 attn_mask.sum(-1) == attn_mask.shape[-1])] = False
             
+            # 这里的transformer层没有出现参考点，而是使用了attn_mask，是因为这里使用的注意力机制是基本的MultiheadAttention
+            # 而不是MSDA，MSDA需要参考点，而基本的MultiheadAttention不需要参考点。
+            # 基本的MultiheadAttention就只需要q、k、v，而不需要参考点，mask用于屏蔽不需要的位置
+
+            # 这里的解码器根据配置文件使用的是DetrTransformerDecoderLayer，代码在mmdet\models\layers\transformer\detr_layers.py中
+            # 但是detr_layers.py中的self_attn和cross_attn的调用顺序是固定的，不能根据配置文件中operation_order参数进行自动调整
+            # 此外，detr_layers.py中也找不到attn_masks参数，因此detr_layers.py中的这个代码虽然名字完全一致，但是代码对不上。
+
+            # 从代码上下文来看，BEVFormer中的BEVFormerLayer与下面的代码更适配，该代码位于projects\mmdet3d_plugin\bevformer\modules\encoder.py中
+            # 但是BEVFormerLayer的self_attn的k和v分别使用的是prev_bev，而不是query，这是时序相关的内容，所以也不是完全一致
+
+            # 综上所述，关于解码器的代码，建议综合参考DetrTransformerDecoderLayer和BEVFormerLayer，而不是单独参考其中的一个
+            # 关于self_attn和cross_attn的调用顺序，以及attn_masks的使用，建议参考BEVFormerLayer，而不是DetrTransformerDecoderLayer
+            # 关于self_attn和cross_attn的q、k、v的输入，建议参考DetrTransformerDecoderLayer，而不是BEVFormerLayer
+
+            # 根据配置文件，在具体的解码器层中，self_attn和cross_attn注意力机制都是基本的MultiheadAttention，完全共享参数
+            # self_attn和cross_attn的区别体现在q，k，v的输入不同，attn_masks的输入不同，以及key_padding_mask的输入不同
+            # cross_attn的q，k，v分别是输入的query，key，value，而self_attn的q，k，v分别是输入的query，query，query，关于这一点参见DetrTransformerDecoderLayer
+            # 此外，attn_masks列表的长度为一，只有第一个注意力机制（即cross_attn）才会用到attn_mask，关于这一点参见BEVFormerLayer；
+
+            # FIXME:这里的transformer_decoder是如何预测占用体素的？？？
+
+            # Mask2Former通过将交叉注意力限制在每个查询的预测掩码的前景区域内来提取局部特征，而不是关注完整的特征图
+
+            # 按照配置文件，每一层解码器的构成如下：
+            # 'cross_attn', 'norm', 'self_attn', 'norm', 'ffn', 'norm'
 
             # cross_attn + self_attn
             layer = self.transformer_decoder.layers[i]
+
+            # attn_masks列表中只有一个元素，确保仅有第一个注意力机制（即cross_attn）中会用到attn_mask，self_attn中不会用到attn_mask
             attn_masks = [attn_mask, None]
             query_feat = layer(
-                query=query_feat,
-                key=decoder_inputs[level_idx],
-                value=decoder_inputs[level_idx],
-                query_pos=query_embed,
-                key_pos=decoder_positional_encodings[level_idx],
-                attn_masks=attn_masks,
+                query=query_feat,   # 初始值源自可学习参数
+                key=decoder_inputs[level_idx],  # 源自输入体素特征voxel_feats，只会给到cross_attn，不会给到self_attn
+                value=decoder_inputs[level_idx], # 源自输入体素特征voxel_feats，只会给到cross_attn，不会给到self_attn
+                query_pos=query_embed,  # 初始值源自可学习参数，cross_attn和self_attn都会用到
+                key_pos=decoder_positional_encodings[level_idx], # 位置编码，源自对输入体素特征voxel_feats的位置编码，只有cross_attn会用到，self_attn使用的是query_pos
+                attn_masks=attn_masks, # 注意力掩码，列表长度为1，只有cross_attn会用到，self_attn不会用到
                 query_key_padding_mask=None,
                 key_padding_mask=None)
             
+            # 在每一层解码器之后，基于解码器输出的查询特征query_feat预测类别、掩码和注意力掩码
             cls_pred, mask_pred, attn_mask = self.forward_head(
                 query_feat, mask_features, 
                 multi_scale_memorys[(i + 1) % self.num_transformer_feat_level].shape[-3:])
